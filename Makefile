@@ -22,6 +22,11 @@ NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
 
+# Debug mode?
+ifeq ($(dbg),1)
+  NVCC_FLAGS += -g -G
+endif
+
 # We will place .o files in the `build` directory (create it if it doesn't exist)
 BUILD_DIR = build
 ifeq ($(OS), Windows_NT)
