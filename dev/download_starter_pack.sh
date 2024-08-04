@@ -4,7 +4,7 @@
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 # Base URL
-BASE_URL="https://huggingface.co/datasets/chrisdryden/llmcDatasets/resolve/main/"
+BASE_URL="https://hf-mirror.com/datasets/chrisdryden/llmcDatasets/resolve/main/"
 
 # Directory paths based on script location
 SAVE_DIR_PARENT="$SCRIPT_DIR/.."
