@@ -39,7 +39,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
-// CUDA error checking
+// CUDA error checking, called by macro, error is cuda original code
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
@@ -60,6 +60,10 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 static cublasComputeType_t cublas_compute_type;
+
+/**
+ * cuda basic linear algebra handle
+ */
 cublasHandle_t cublas_handle;
 
 namespace cg = cooperative_groups;
@@ -891,29 +895,33 @@ void fused_classifier3(float* logits, float* losses,
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
-    int padded_vocab_size; // padded to e.g. %128==0, 50304
+    int padded_vocab_size; // padded to e.g. %128==0, 50304, mod 128
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
-    int channels; // number of channels, e.g. 768
+    int channels; // hidden state dimension, number of channels, e.g. 768
 } GPT2Config;
 
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
-    float* wte; // (V, C)
-    float* wpe; // (maxT, C)
-    float* ln1w; // (L, C)
-    float* ln1b; // (L, C)
-    float* qkvw; // (L, 3*C, C)
-    float* qkvb; // (L, 3*C)
-    float* attprojw; // (L, C, C)
-    float* attprojb; // (L, C)
-    float* ln2w; // (L, C)
+    // V --> vocabulary size,
+    // C --> channel size,
+    // maxT --> max sequence lenght
+    // L --> layer number
+    float* wte; // (V, C), word token embedding
+    float* wpe; // (maxT, C), word position embedding
+    float* ln1w; // (L, C), layer norm weight
+    float* ln1b; // (L, C), layer norm bias
+    float* qkvw; // (L, 3*C, C), qkv weight
+    float* qkvb; // (L, 3*C), qkv bias
+    float* attprojw; // (L, C, C), attention linear projection weight
+    float* attprojb; // (L, C), attention linear projection bias
+    float* ln2w; // (L, C),
     float* ln2b; // (L, C)
-    float* fcw; // (L, 4*C, C)
-    float* fcb; // (L, 4*C)
-    float* fcprojw; // (L, C, 4*C)
-    float* fcprojb; // (L, C)
+    float* fcw; // (L, 4*C, C),  full connect weight
+    float* fcb; // (L, 4*C),  full connect bias
+    float* fcprojw; // (L, C, 4*C), fc project weight
+    float* fcprojb; // (L, C), fc project bias
     float* lnfw; // (C)
     float* lnfb; // (C)
 } ParameterTensors;
@@ -1082,8 +1090,18 @@ float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) 
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
+/**
+ * Recall that GPT is:
+ *  1. input: batch_size * seq_len * embedding_size
+ *  2. positional embedding: add with input
+ *  3. multi-head qkv: q = input @ (embedding_size, hidden_size = head_num * sub_hidden_size)
+ *      same with k, v;
+ *  4. transform qkv: q = batch_size * seq_len * (head_num * sub_hidden)
+ *                      = (seq_len * batch_size * head_num) * sub_hidden
+ *  5. attention: softmax(q @ k^T) * v / sqrt(hidden_size)
+ */
 typedef struct {
-    GPT2Config config;
+    GPT2Config config; // contain the basic config parameter of GPT
     // the weights of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
@@ -1606,15 +1624,31 @@ int main(int argc, char *argv[]) {
 
     // set up the device
     int deviceIdx = 0;
+
+    /** Step 1: Set cuda device
+     *      cudaSetDevice is select the device you need,
+     *      cudaCheck is the normal check function
+     *  Step 2: Check device property
+     *      1. get property of the device
+     */
+
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    // setup cuBLAS and cuBLASLt
+    // setup cuBLAS and cuBLASLt, get handle
     cublasCheck(cublasCreate(&cublas_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    // whether support Tensor Float32, Amphere architecture support
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    /** TF32 is fast float operation, F32 is normal float operation
+     * F stands for standard float operation
+     * PEDANTIC stands for strict float operation (high precision)
+     * TF stands for Tensor core support float, all little loss
+     */
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+
+    // Set the math calculation mode
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     printf("| device                | %-50s |\n", deviceProp.name);
     printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
