@@ -950,6 +950,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
+// 
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, int on_device) {
     // on_device: 0 = CPU, 1 = GPU
     // calculate the number of parameters
@@ -959,17 +960,23 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     }
     // malloc all parameters all at once on the device
     float* params_memory;
+
+    // cudaMalloc is the cuda malloc function
+    // cudaMalloc(void** ptr, bytes)
     if (on_device) {
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
     } else {
         params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     }
     // assign all the tensors their place in the array
+    // get the addr of param
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
+
+    // binding the ptr to the memory address 
     float* params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         *(ptrs[i]) = params_memory_iterator;
@@ -1097,29 +1104,30 @@ float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) 
  *  3. multi-head qkv: q = input @ (embedding_size, hidden_size = head_num * sub_hidden_size)
  *      same with k, v;
  *  4. transform qkv: q = batch_size * seq_len * (head_num * sub_hidden)
- *                      = (seq_len * batch_size * head_num) * sub_hidden
- *  5. attention: softmax(q @ k^T) * v / sqrt(hidden_size)
+ *                      = (batch_size * head_num) * seq_len * sub_hidden
+ *  5. attention: softmax(q @ k^T) * v / sqrt(sub_hidden)
+ *  
  */
 typedef struct {
     GPT2Config config; // contain the basic config parameter of GPT
     // the weights of the model, and their sizes
     ParameterTensors params;
-    size_t param_sizes[NUM_PARAMETER_TENSORS];
-    float* params_memory;
-    size_t num_parameters;
+    size_t param_sizes[NUM_PARAMETER_TENSORS]; 
+    float* params_memory; //TODO: what is this?
+    size_t num_parameters; // parameter number
     // gradients of the weights
-    ParameterTensors grads;
-    float* grads_memory;
+    ParameterTensors grads; // the grad of every parameter
+    float* grads_memory; //TODO: what is this?
     // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
+    float* m_memory; //TODO: what is this?
+    float* v_memory; //TODO: what is this?
     // the activations of the model, and their sizes
-    ActivationTensors acts;
+    ActivationTensors acts; //TODO: what is this?
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
     size_t num_activations;
     // gradients of the activations
-    GradActTensors grads_acts;
+    GradActTensors grads_acts; //TODO: what is this?
     size_t num_grad_acts;
     float* grads_acts_memory;
     // other run state configuration
@@ -1131,13 +1139,24 @@ typedef struct {
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
 
+/** Build gpt2 from checkpoint, check point:
+ *      1.
+ *      2.
+ *      3.
+ */
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
-    FILE *model_file = fopenCheck(checkpoint_path, "rb");
+    FILE *model_file = fopenCheck(checkpoint_path, "rb"); // open file and get file handle
     int model_header[256];
+
+    // read 256 int from the model file
     freadCheck(model_header, sizeof(int), 256, model_file);
+
+    // magic number check
     if (model_header[0] != 20240326) { fprintf(stderr, "Bad magic model file\n"); exit(EXIT_FAILURE); }
+
+    // Here is the train_gpt2.py define the model information
     if (model_header[1] != 3) {
         // was bumped from 1 -> 3 to incorporate the padded vocab size
         fprintf(stderr, "Bad version in model file\n");
@@ -1146,6 +1165,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // read in hyperparameters
+    // recovery the parameter
     model->config.max_seq_len = model_header[2];
     model->config.vocab_size = model_header[3];
     model->config.num_layers = model_header[4];
@@ -1154,9 +1174,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.padded_vocab_size = model_header[7];
 
     // allocate space for all the parameters and read them in
+    // param_size is the parameter size
     fill_in_parameter_sizes(model->param_sizes, model->config);
 
     // count the number of parameters
+    // weight number
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
@@ -1164,13 +1186,24 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->num_parameters = num_parameters;
 
     // create memory for model parameters on the device
+    // calculate and malloc memory
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
     // read in all the parameters from file and copy them to device
+    // alloc memory in cpu
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
+
+    //  read parameter from file to cpu
     freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
+
+    // copy the memory from cpu --> gpu
+    // cudaMemorycpy(dest, src, sz, mode)
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+
+    // free the cpu
     free(params_memory_cpu);
+
+    // close the file
     fcloseCheck(model_file);
 
     // other inits
@@ -1656,6 +1689,8 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+
+    // load the parameter weight from the model
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
@@ -1667,6 +1702,7 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
+    //!TODO: read next time
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);

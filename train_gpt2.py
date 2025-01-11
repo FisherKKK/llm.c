@@ -37,14 +37,19 @@ import torch.distributed as dist
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+
+# OpenAI's Gelu, it's just a calculation function with forward
+# out = 1/2 * input * (1 + tanh(sqrt(2 / pi) * (input + 0.044715 * pow(input, 3))))
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
+# whether to use flash-attn
 # using a global to toggle flash-attention
 FLASH = 0
 
+# attn layer
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -59,6 +64,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        # bias is the mask
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
@@ -66,32 +72,49 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
+        # qkv is (B, T, 3 * C)
+        # the split will make the q, k, v seperate with (B, T, C)
         q, k, v = qkv.split(self.n_embd, dim=2)
+
+        # review the q, k, v as 
+        # (B, T, H * C) --> (B, T, H, C) --> (B, H, T, C)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if FLASH:
             # flashattention
+            # causal attention with mask
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
+            # casual attn calculation must will mask
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+            # mask the attn with -inf
+            # attn is (B, H, T, T)
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # attn is (B, H, T, T)
             att = F.softmax(att, dim=-1)
+            # y is (B, H, T, hs)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # transpose --> (B, T, H, hs)
+        # view --> (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
+        # projection is for mix the different head
         y = self.c_proj(y)
         return y
 
+# Multi-layer perceptron
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd) # higer dimension
+        self.gelu    = NewGELU() # activation
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd) # lower dimension
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
@@ -100,6 +123,9 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# Block is x -> layernorm -> attn -> layernorm -> mlp ->
+#          |----------------------+
+#                                 |-------------------+     
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -117,6 +143,7 @@ class Block(nn.Module):
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
+# configuration is of GPT
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -125,23 +152,33 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
 
+# GPT model is stack of block
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
 
+        # word embedding
+        # word positional embedding
+        # blocks --> is stack of block
+        # norm layer is the last process
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+
+        # output head layer
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+
+        # bind the wte and head out weight 
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
+        # initialize the weight
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
         self.apply(self._init_weights)
@@ -149,6 +186,7 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             # apply special scaled init to the residual projections, per GPT-2 paper
+            # according to the flag define the std
             std = 0.02 if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
             # we want to skip initializing lm_head, which shares parameters with wte
             # and wte was already initialized down below during the Embedding init
@@ -159,6 +197,8 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
+    # here is the forward function
+    # idx is (B, T)
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
         b, t = idx.size()
@@ -174,12 +214,18 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
+
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            # logits is (B, T, V)
             logits = self.lm_head(x)
+
+            # but logits can be viewed as (B * T, V) as targets
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
+            # x have been calculated
+            # inference x is (B, T, C) --> (B, 1, C)
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
@@ -189,6 +235,7 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    # load model weight from hg
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -209,25 +256,42 @@ class GPT(nn.Module):
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
+
+        # the parameter key of the model
         sd_keys = sd.keys()
+
+        # get the key of model
+        # ignore the attn.bias
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
+        # from the pretrained model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
+        # copy weight from transformers
         sd_keys_hf = sd_hf.keys()
+        
+        # ignore attn.masked_bias, attn.bias
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+
+        # because the linear is Conv1D, so there is a transposed
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
+
+            # deal with the transposed parameter
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
+
+                # copy the parameter
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
             else:
@@ -245,6 +309,8 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+
+        # dimension is importance
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
@@ -269,6 +335,8 @@ class GPT(nn.Module):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
         return optimizer
 
+
+    # inference time of the model
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
@@ -278,14 +346,19 @@ class GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
+            # get newest context window with lenghth block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
+            # return the propability of next word
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
+            # temperature make random
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
+                # get the topk
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                # mask with -inf
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
@@ -380,6 +453,7 @@ class DistributedDataLoader:
 # -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
 
+# write the fp32 --> file with bytes
 def write_fp32(tensor, file):
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()
@@ -396,10 +470,16 @@ def write_tensors(model_tensors, L, file, dtype):
     # writes the GPT-2 model's weights to a binary file
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
+
+    # write sequence:
+    #   1. wte
+    #   2. wpe
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
     write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+
+    # write: ln1.weight * n
     for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file) # 
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
@@ -425,6 +505,7 @@ def write_tensors(model_tensors, L, file, dtype):
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
+# pad the vocab to the multiple's mul
 @torch.no_grad()
 def pad_vocab(tensor, multiple=128, value=0):
     """
@@ -446,6 +527,7 @@ def pad_vocab(tensor, multiple=128, value=0):
     assert padded.shape == (Vp, C)
     return padded
 
+#! important because of the model format
 def write_model(model, filename, dtype):
     # everything we need to instantiate the model
     # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
@@ -454,6 +536,8 @@ def write_model(model, filename, dtype):
         "float32": 3, # 3: all tensors are fp32, padded vocab
         "bfloat16": 5, # 5: all tensors are bf16, padded vocab
     }[dtype]
+
+    # The 256 number of model file
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240326 # magic
     header[1] = version # checkpoint version

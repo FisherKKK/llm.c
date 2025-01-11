@@ -19,10 +19,13 @@
 #endif
 
 // ----------------------------------------------------------------------------
+// In a word, here is the wrap of the original function
+
 // fread convenience utils, with nice handling of error checking using macros
 // simple replace fopen, fread, fclose, fseek
 // with fopenCheck, freadCheck, fcloseCheck, fseekCheck
 
+// just open the file and check the error
 extern inline FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
     FILE *fp = fopen(path, mode);
     if (fp == NULL) {
@@ -41,6 +44,7 @@ extern inline FILE *fopen_check(const char *path, const char *mode, const char *
 
 #define fopenCheck(path, mode) fopen_check(path, mode, __FILE__, __LINE__)
 
+// read file from `ptr` <-- `stream` with type `size` and number `nmemb`
 extern inline void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
     size_t result = fread(ptr, size, nmemb, stream);
     if (result != nmemb) {
