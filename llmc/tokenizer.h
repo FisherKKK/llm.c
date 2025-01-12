@@ -15,10 +15,13 @@ Which could be tricky in C because of the regex involved, to look into later.
 
 // ----------------------------------------------------------------------------
 
+/** Tokenizer
+ * 
+ */
 typedef struct {
-    uint32_t vocab_size;
-    char **token_table;
-    int init_ok;
+    uint32_t vocab_size; // vocab size
+    char **token_table; // token table
+    int init_ok; // whether init tokenizer
     int eot_token; // <|endoftext|> token id
 } Tokenizer;
 
@@ -51,11 +54,16 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
         return;
     }
     // read in the header
+    // check
     uint32_t header[256];
     freadCheck(header, sizeof(uint32_t), 256, file);
     assert(header[0] == 20240328);
     int version = header[1];
+
+    // get tokenizer vocab size
     tokenizer->vocab_size = header[2];
+
+    // get eot by version
     if (version == 1) {
         // version 1 didn't include the EOT token id
         // so we assume it is 50256, the EOT in GPT-2
@@ -69,13 +77,22 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     }
     // read in all the tokens
     unsigned char length;
+
+    // generate tiktoken table
+    // token id ==> token
+    // table = (char**)sizeof(char*) * vocab_size
     tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
     for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+        // read token length
         freadCheck(&length, sizeof(unsigned char), 1, file);
         assert(length > 0); // every token should be at least one character
+        // alloc memory
         char *token_bytes = (char *)mallocCheck(length + 1);
+        // read token
         freadCheck(token_bytes, sizeof(char), length, file);
+        // pad \0
         token_bytes[length] = '\0';  // Add null terminator for printing
+        // set table member
         tokenizer->token_table[i] = token_bytes;
     }
     // cleanups

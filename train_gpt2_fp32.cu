@@ -1706,6 +1706,8 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
+
+    // all the token number --> get batch number
     int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
@@ -1722,14 +1724,19 @@ int main(int argc, char *argv[]) {
 
     // build the Tokenizer
     Tokenizer tokenizer;
+    // init tokenizer
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
+
+    //TODO: what?
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+
+    //TODO: logits with V
     float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
-    // train
+    // train the model
     struct timespec start, end;
     double total_sum_iteration_time_s = 0.0;
     for (int step = 0; step <= train_num_batches; step++) {

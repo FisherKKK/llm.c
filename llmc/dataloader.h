@@ -26,6 +26,7 @@ Implements:
 // Distributed Data Loader
 #define HEADER_SIZE 256
 
+// DataLoader for sequence loader
 typedef struct {
     // variables related to distributed training
     // each process/worker has to access different parts of the data
@@ -58,6 +59,9 @@ typedef struct {
     int64_t file_size_bytes;
 } DataLoader;
 
+/**
+ * dataloader load data from shard
+ */
 int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     if (loader->should_shuffle) {
         shard_index = loader->shard_indices[shard_index];
@@ -68,10 +72,14 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     if (loader->tokens_file != NULL) {
         fcloseCheck(loader->tokens_file);
     }
+
+    // open the token file
     loader->tokens_file = fopenCheck(filename, "rb");
     // validate the header
     int header[HEADER_SIZE];
     freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
+
+    // validate the token file
     if (header[0] != 20240520) {
         printf("Bad magic in the data file\n");
         printf("---> HINT: Are you passing in a correct file?\n");
@@ -79,18 +87,29 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
         exit(EXIT_FAILURE);
     }
     if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
+
+    // number of token
     int64_t ntok = header[2]; // number of tokens in the file
     assert(ntok > 0); // we expect some tokens in the file. this should never trip, right?
     // determine the file size and make sure it is consistent with the number of tokens
+
+    // seek to the end of file
     fseekCheck(loader->tokens_file, 0, SEEK_END); // seek to end of file
+
+    // the file size
     loader->file_size_bytes = ftell(loader->tokens_file); // read the offset, i.e. file size
+
+    // back to begin
     fseekCheck(loader->tokens_file, 0, SEEK_SET); // seek back to the beginning
     // we expect ntok in the file to be consistent with filesize, assert that is the case
+
+    // compare the exp size and real size
     int64_t expected_file_size = HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
     if (loader->file_size_bytes != expected_file_size) {
         printf("Error: file size is not as expected\n");
         exit(EXIT_FAILURE);
     }
+
     // -1 uint16_t due to us taking B*T+1 tokens but moving by B*T tokens
     loader->shard_num_samples = (ntok * sizeof(uint16_t) - sizeof(uint16_t)) / loader->total_batch_size_bytes;
     return ntok;
@@ -139,6 +158,8 @@ void dataloader_advance_(DataLoader *loader) {
     }
 }
 
+/** Init dataloader, process rank is mainly for
+ */
 void dataloader_init(DataLoader *loader,
                      const char* filename_pattern,
                      size_t B,
@@ -153,15 +174,22 @@ void dataloader_init(DataLoader *loader,
     loader->tokens_file = NULL;
     loader->should_shuffle = should_shuffle;
     loader->header_bytes = HEADER_SIZE * sizeof(int);
+
+    // bytes = Process * B * L * sizeof(token)
     loader->total_batch_size_bytes = ((loader->num_processes * (loader->B * loader->T)) * sizeof(uint16_t));
+
+    // offset of the bytes
     loader->local_batch_offset_bytes = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
 
     // glob to get the list of files matching the pattern, these are our data shards
+    // get the file by name
     int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
     if (glob_status != 0) {
         printf("Error: failed to glob pattern: %s\n", filename_pattern);
         exit(EXIT_FAILURE);
     }
+
+    // check the result path number
     if (loader->glob_result.gl_pathc == 0) {
         printf("Error: no files found matching the pattern: %s\n", filename_pattern);
         exit(EXIT_FAILURE);
@@ -171,7 +199,10 @@ void dataloader_init(DataLoader *loader,
         mt19937_state shuffle_rng;
         manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
+        // path number
         loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+
+        // set the result path
         init_identity_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc);
         loader->intra_shard_indices = NULL;  // dynamically allocated allowing different shard sizes
     }
