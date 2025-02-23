@@ -701,6 +701,7 @@ void encoder_forward(float* out,
     const int block_size = 512;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N / 4, block_size);
+    // TODO: cuda kernel
     encoder_forward_kernel3<<<grid_size, block_size>>>((float4*) out, inp, (float4*) wte, (float4*) wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -1017,6 +1018,9 @@ typedef struct {
     float* output;
 } ActivationTensors;
 
+/**
+ * fill in the activition layer
+ */
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
@@ -1064,7 +1068,9 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
     act_sizes[2] = B * T * C; // residual3
 }
 
-
+/**
+ * Cuda alloc memory
+ */
 float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
     size_t num_activations = 0;
     for (size_t i = 0; i < n; i++) {
@@ -1110,11 +1116,13 @@ float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) 
  */
 typedef struct {
     GPT2Config config; // contain the basic config parameter of GPT
+
     // the weights of the model, and their sizes
     ParameterTensors params;
-    size_t param_sizes[NUM_PARAMETER_TENSORS]; 
-    float* params_memory; //TODO: what is this?
+    size_t param_sizes[NUM_PARAMETER_TENSORS]; // the size of parameter
+    float* params_memory; // value of parameter
     size_t num_parameters; // parameter number
+
     // gradients of the weights
     ParameterTensors grads; // the grad of every parameter
     float* grads_memory; //TODO: what is this?
@@ -1230,6 +1238,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // convenience parameters
+    // cp the parameter
     int V = model->config.vocab_size;
     int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
@@ -1245,11 +1254,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // allocate space for all the activations if needed (done here, lazily)
+    // allocate the space for activation layer
     if(model->acts_memory == NULL) {
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
         // and now allocate the space
+
+        // calculate the size of activation
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -1272,6 +1284,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // copy inputs/targets to the model
+    // copy from memory to cuda
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
         cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
@@ -1702,7 +1715,6 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    //!TODO: read next time
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
@@ -1743,6 +1755,7 @@ int main(int argc, char *argv[]) {
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss
+        // validation step
         if (step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);

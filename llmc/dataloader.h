@@ -27,6 +27,7 @@ Implements:
 #define HEADER_SIZE 256
 
 // DataLoader for sequence loader
+// organize by shard and sample number
 typedef struct {
     // variables related to distributed training
     // each process/worker has to access different parts of the data
@@ -142,6 +143,8 @@ void dataloader_reset(DataLoader *loader) {
 }
 
 void dataloader_advance_(DataLoader *loader) {
+
+    // if enter the end of shard
     if (loader->current_shard_idx == loader->glob_result.gl_pathc - 1) {
         // if we are at the last shard, we reset the loader and start a new epoch
         dataloader_reset(loader);
@@ -159,6 +162,7 @@ void dataloader_advance_(DataLoader *loader) {
 }
 
 /** Init dataloader, process rank is mainly for
+ *  distributed training need rank
  */
 void dataloader_init(DataLoader *loader,
                      const char* filename_pattern,
@@ -167,8 +171,8 @@ void dataloader_init(DataLoader *loader,
                      int process_rank,
                      int num_processes,
                      int should_shuffle) {
-    loader->process_rank = process_rank;
-    loader->num_processes = num_processes;
+    loader->process_rank = process_rank; // get rank
+    loader->num_processes = num_processes; // get process number
     loader->B = B;
     loader->T = T;
     loader->tokens_file = NULL;
@@ -183,6 +187,7 @@ void dataloader_init(DataLoader *loader,
 
     // glob to get the list of files matching the pattern, these are our data shards
     // get the file by name
+    // get file name
     int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
     if (glob_status != 0) {
         printf("Error: failed to glob pattern: %s\n", filename_pattern);
@@ -200,6 +205,7 @@ void dataloader_init(DataLoader *loader,
         manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
         // path number
+        // get all files
         loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
 
         // set the result path
@@ -222,6 +228,7 @@ void dataloader_init(DataLoader *loader,
     // printf("DataLoader: Found %ld tokens across %zu shards\n", ntok_total, loader->glob_result.gl_pathc);
 
     // allocate all the space we'll need
+    //? TODO: why there is one extra space
     loader->buffer = (uint16_t*)mallocCheck((B * T + 1) * sizeof(uint16_t));
     loader->inputs = (int*)mallocCheck(B * T * sizeof(int));
     loader->targets = (int*)mallocCheck(B * T * sizeof(int));
