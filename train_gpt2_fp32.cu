@@ -1069,17 +1069,17 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
 }
 
 /**
- * Cuda alloc memory
+ * Cuda alloc memory, make the original pointer point to the memory
  */
 float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
     size_t num_activations = 0;
     for (size_t i = 0; i < n; i++) {
         num_activations += act_sizes[i];
     }
-    float* acts_memory;
+    float* acts_memory; // allocate the chunk cuda memory
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
     float* acts_memory_iterator = acts_memory;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) { // point to the memory
         *(targets[i]) = acts_memory_iterator;
         acts_memory_iterator += act_sizes[i];
     }
@@ -1228,6 +1228,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+/**! Here is the core of forward
+ */
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     // targets are optional and could be NULL
 
@@ -1263,16 +1265,19 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // calculate the size of activation
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        // activation size in sum
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
+        // allocate the memory of activation, chunk memory
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+        // alloc pinned memory in cpu, accelerating speed among cpu and gpu
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
@@ -1290,7 +1295,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
 
-    // forward pass
+    //TODO: forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
